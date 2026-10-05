@@ -110,9 +110,10 @@ void convertRilDataCallToHal(RIL_Data_Call_Response_v9 *dcResponse,
 void convertRilDataCallToHal(RIL_Data_Call_Response_v11 *dcResponse,
         SetupDataCallResult& dcResult);
 
-size_t rilDataCallResponseSize();
+size_t rilDataCallRecordSize(size_t responseLen);
 
-void convertRilDataCallRecordToHal(void *response, int index, SetupDataCallResult& dcResult);
+void convertRilDataCallRecordToHal(void *response, size_t recordSize, int index,
+        SetupDataCallResult& dcResult);
 
 void convertRilDataCallListToHal(void *response, size_t responseLen,
         hidl_vec<SetupDataCallResult>& dcResultList);
@@ -4069,7 +4070,8 @@ int radio::setupDataCallResponse(int slotId,
 
         SetupDataCallResult result = {};
 
-        if (response == NULL || responseLen % rilDataCallResponseSize() != 0) {
+        if (response == NULL || responseLen == 0
+                || responseLen % rilDataCallRecordSize(responseLen) != 0) {
             if (response != NULL) {
                 RLOGE("setupDataCallResponse: Invalid response");
                 if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
@@ -4082,7 +4084,8 @@ int radio::setupDataCallResponse(int slotId,
             result.gateways = hidl_string();
             result.pcscf = hidl_string();
         } else {
-            convertRilDataCallRecordToHal(response, 0, result);
+            convertRilDataCallRecordToHal(response, rilDataCallRecordSize(responseLen), 0,
+                    result);
         }
 
         Return<void> retStatus = radioService[slotId]->mRadioResponse->setupDataCallResponse(
@@ -4762,7 +4765,7 @@ int radio::getDataCallListResponse(int slotId,
 
         hidl_vec<SetupDataCallResult> ret;
         if ((response == NULL && responseLen != 0)
-                || responseLen % rilDataCallResponseSize() != 0) {
+                || responseLen % rilDataCallRecordSize(responseLen) != 0) {
             RLOGE("getDataCallListResponse: invalid response");
             if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
         } else {
@@ -7227,25 +7230,46 @@ void convertRilDataCallToHal(RIL_Data_Call_Response_v11 *dcResponse,
     dcResult.mtu = dcResponse->mtu;
 }
 
-// The RIL version RIL_Init reports selects the data-call record layout: RIL
-// v6 to v8 stacks fill RIL_Data_Call_Response_v6, v9 and v10 stacks add pcscf
-// in RIL_Data_Call_Response_v9, and v11 onward add mtu in
-// RIL_Data_Call_Response_v11. Record sizes share common multiples, so the
-// response length only validates the selected layout as a whole number of
-// records.
-size_t rilDataCallResponseSize() {
+// The RIL version RIL_Init reports names the data-call record layout: RIL v6
+// to v8 stacks fill RIL_Data_Call_Response_v6, v9 and v10 stacks add pcscf in
+// RIL_Data_Call_Response_v9, and v11 onward add mtu in
+// RIL_Data_Call_Response_v11. Record sizes share common multiples, so that
+// layout wins whenever the response is a whole number of its records; a
+// length that only one other layout divides selects that layout, which keeps
+// a stack whose version and records disagree parseable. A length no layout
+// divides returns the version's size and fails the caller's validation.
+size_t rilDataCallRecordSize(size_t responseLen) {
+    const size_t sizes[] = {
+        sizeof(RIL_Data_Call_Response_v6),
+        sizeof(RIL_Data_Call_Response_v9),
+        sizeof(RIL_Data_Call_Response_v11),
+    };
+    size_t preferred = sizes[2];
     if (s_vendorFunctions->version < 9) {
-        return sizeof(RIL_Data_Call_Response_v6);
+        preferred = sizes[0];
     } else if (s_vendorFunctions->version < 11) {
-        return sizeof(RIL_Data_Call_Response_v9);
+        preferred = sizes[1];
     }
-    return sizeof(RIL_Data_Call_Response_v11);
+    if (responseLen % preferred == 0) {
+        return preferred;
+    }
+    size_t only = 0;
+    for (size_t size : sizes) {
+        if (size != preferred && responseLen % size == 0) {
+            if (only != 0) {
+                return preferred;
+            }
+            only = size;
+        }
+    }
+    return only != 0 ? only : preferred;
 }
 
-void convertRilDataCallRecordToHal(void *response, int index, SetupDataCallResult& dcResult) {
-    if (s_vendorFunctions->version < 9) {
+void convertRilDataCallRecordToHal(void *response, size_t recordSize, int index,
+        SetupDataCallResult& dcResult) {
+    if (recordSize == sizeof(RIL_Data_Call_Response_v6)) {
         convertRilDataCallToHal(&((RIL_Data_Call_Response_v6 *) response)[index], dcResult);
-    } else if (s_vendorFunctions->version < 11) {
+    } else if (recordSize == sizeof(RIL_Data_Call_Response_v9)) {
         convertRilDataCallToHal(&((RIL_Data_Call_Response_v9 *) response)[index], dcResult);
     } else {
         convertRilDataCallToHal(&((RIL_Data_Call_Response_v11 *) response)[index], dcResult);
@@ -7254,11 +7278,12 @@ void convertRilDataCallRecordToHal(void *response, int index, SetupDataCallResul
 
 void convertRilDataCallListToHal(void *response, size_t responseLen,
         hidl_vec<SetupDataCallResult>& dcResultList) {
-    int num = responseLen / rilDataCallResponseSize();
+    size_t recordSize = rilDataCallRecordSize(responseLen);
+    int num = responseLen / recordSize;
 
     dcResultList.resize(num);
     for (int i = 0; i < num; i++) {
-        convertRilDataCallRecordToHal(response, i, dcResultList[i]);
+        convertRilDataCallRecordToHal(response, recordSize, i, dcResultList[i]);
     }
 }
 
@@ -7267,7 +7292,7 @@ int radio::dataCallListChangedInd(int slotId,
                                   size_t responseLen) {
     if (radioService[slotId] != NULL && radioService[slotId]->mRadioIndication != NULL) {
         if ((response == NULL && responseLen != 0)
-                || responseLen % rilDataCallResponseSize() != 0) {
+                || responseLen % rilDataCallRecordSize(responseLen) != 0) {
             RLOGE("dataCallListChangedInd: invalid response");
             return 0;
         }
